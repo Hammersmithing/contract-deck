@@ -9,11 +9,21 @@ import UniformTypeIdentifiers
 /// spawns at the correct width (same trick as ClaudeDeck).
 final class ClaudeTerminalView: LocalProcessTerminalView {
     private var started = false
+    private var startedAt = Date()
+    // The view can't be its own processDelegate (it already defines the
+    // protocol's methods as non-open), so a tiny relay object forwards exits.
+    private lazy var relay = ProcessExitRelay(owner: self)
 
     override func layout() {
         super.layout()
         guard !started, bounds.width > 1, bounds.height > 1 else { return }
         started = true
+        processDelegate = relay
+        start()
+    }
+
+    private func start() {
+        startedAt = Date()
         var env = ProcessInfo.processInfo.environment
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
@@ -24,6 +34,32 @@ final class ClaudeTerminalView: LocalProcessTerminalView {
                      execName: nil,
                      currentDirectory: NSHomeDirectory())
     }
+
+    fileprivate func handleExit(code: Int32?) {
+        // A session that ran a while and ended (e.g. /exit, crash of the CLI)
+        // gets relaunched so the pane never sits dead. An immediate exit means
+        // claude can't start — don't loop, say so.
+        if Date().timeIntervalSince(startedAt) > 5 {
+            feed(text: "\r\n[claude exited (code \(code ?? -1)) — restarting]\r\n")
+            start()
+        } else {
+            feed(text: "\r\n[claude failed to start — is `claude` on PATH for zsh?]\r\n")
+        }
+    }
+}
+
+private final class ProcessExitRelay: LocalProcessTerminalViewDelegate {
+    weak var owner: ClaudeTerminalView?
+    init(owner: ClaudeTerminalView) { self.owner = owner }
+
+    func processTerminated(source: TerminalView, exitCode: Int32?) {
+        DispatchQueue.main.async { [weak self] in
+            self?.owner?.handleExit(code: exitCode)
+        }
+    }
+    func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
+    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
 }
 
 struct TerminalHost: NSViewRepresentable {
@@ -46,6 +82,12 @@ final class AppState {
     }
     @ObservationIgnored var lastPane = 0
     @ObservationIgnored let terminal = ClaudeTerminalView(frame: .init(x: 0, y: 0, width: 800, height: 300))
+
+    init() {
+        // ponytail: `open --args left.pdf right.pdf` loads the panes at launch
+        let pdfs = CommandLine.arguments.dropFirst().filter { $0.lowercased().hasSuffix(".pdf") }
+        for (i, path) in pdfs.prefix(2).enumerated() { load(URL(fileURLWithPath: path), into: i) }
+    }
 
     func load(_ url: URL, into pane: Int) {
         guard let doc = PDFDocument(url: url) else { NSSound.beep(); return }
@@ -181,6 +223,12 @@ struct ContentView: View {
 @main
 struct ContractDeckApp: App {
     @State private var state = AppState()
+
+    init() {
+        // A write to a dead PTY raises SIGPIPE, which kills the app silently
+        // (no crash report). Standard PTY-app hygiene: ignore it.
+        signal(SIGPIPE, SIG_IGN)
+    }
 
     var body: some Scene {
         WindowGroup {
