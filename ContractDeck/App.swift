@@ -76,9 +76,11 @@ struct Variance: Codable, Identifiable {
     let a: String   // short verbatim quote from doc A ("" if clause absent)
     let b: String   // short verbatim quote from doc B
     let note: String?
-    var approved: Bool?   // optional so claude's JSON (no such key) decodes
+    /// Resolution: 0 = doc A's wording wins, 1 = doc B's, nil = unresolved.
+    /// Optional so claude's JSON (no such key) decodes.
+    var keep: Int?
     var id: Int { n }
-    var isApproved: Bool { approved ?? false }
+    var isResolved: Bool { keep != nil }
 }
 
 /// A user-added annotation: a quote in one pane plus a note.
@@ -96,6 +98,7 @@ struct Comparison: Codable {
     var paths: [String?]
     var variances: [Variance]
     var notes: [UserNote]
+    var keepPane: Int?   // optional so earlier saves still decode
 }
 
 // MARK: - State
@@ -108,6 +111,9 @@ final class AppState {
     var notes: [UserNote] = []
     var soloPane: Int? = nil
     var showInspector = false
+    /// Which doc survives this negotiation; approving a variance defaults to
+    /// this doc's wording winning.
+    var keepPane = 0
 
     @ObservationIgnored let pdfViews: [PDFView] = (0..<2).map { _ in
         let v = PDFView()
@@ -209,7 +215,7 @@ final class AppState {
     /// The badge sits at the page's left edge (x=2), never over the text block.
     /// Returns the located selection, or nil.
     private func stamp(doc: PDFDocument, quote: String, label: String,
-                       highlight: NSColor, badgeColor: NSColor) -> PDFSelection? {
+                       highlight: NSColor, badgeColor: NSColor, strike: Bool = false) -> PDFSelection? {
         guard !quote.isEmpty,
               let sel = doc.findString(quote, withOptions: [.caseInsensitive, .diacriticInsensitive]).first
         else { return nil }
@@ -219,6 +225,12 @@ final class AppState {
                 hl.color = highlight
                 hl.userName = "ContractDeck"
                 page.addAnnotation(hl)
+                if strike {
+                    let st = PDFAnnotation(bounds: line.bounds(for: page), forType: .strikeOut, withProperties: nil)
+                    st.color = .systemRed
+                    st.userName = "ContractDeck"
+                    page.addAnnotation(st)
+                }
             }
         }
         if let page = sel.pages.first {
@@ -249,10 +261,16 @@ final class AppState {
                 }
             }
             for v in variances {
-                let hl: NSColor = v.isApproved ? NSColor.systemGreen.withAlphaComponent(0.35)
-                                               : NSColor.systemYellow.withAlphaComponent(0.5)
+                // Unresolved: yellow both sides. Resolved: winner's wording
+                // green, loser's struck out red.
+                let win = v.keep == pane
+                let hl: NSColor = !v.isResolved ? NSColor.systemYellow.withAlphaComponent(0.5)
+                    : win ? NSColor.systemGreen.withAlphaComponent(0.35)
+                          : NSColor.systemRed.withAlphaComponent(0.2)
+                let badge: NSColor = !v.isResolved ? .systemOrange : win ? .systemGreen : .systemRed
                 let sel = stamp(doc: doc, quote: pane == 0 ? v.a : v.b, label: "V\(v.n)",
-                                highlight: hl, badgeColor: v.isApproved ? .systemGreen : .systemRed)
+                                highlight: hl, badgeColor: badge,
+                                strike: v.isResolved && !win)
                 located[v.n, default: [nil, nil]][pane] = sel
             }
             for (i, note) in notes.enumerated() where note.pane == pane {
@@ -277,11 +295,16 @@ final class AppState {
         if let sel = locatedNotes[note.id] { pdfViews[note.pane].go(to: sel) }
     }
 
-    func toggleApproved(_ n: Int) {
+    /// Resolve variance n: `winner` 0/1 picks that doc's wording; nil means
+    /// "approve with the default" — the Keep doc wins. Same winner again
+    /// un-resolves (toggle).
+    func resolve(_ n: Int, winner: Int? = nil) {
         guard let i = variances.firstIndex(where: { $0.n == n }) else { return }
-        variances[i].approved = !variances[i].isApproved
+        let w = winner ?? keepPane
+        variances[i].keep = variances[i].keep == w ? nil : w
         applyMarkup()
     }
+
 
     /// Turn the current selection into a user note (blue markup) on its pane.
     func annotateSelection() {
@@ -314,7 +337,7 @@ final class AppState {
         guard let name = Self.prompt("Name this comparison:", initial: df.string(from: Date())),
               !name.isEmpty else { return }
         let comp = Comparison(name: name, date: Date(), paths: urls.map { $0?.path },
-                              variances: variances, notes: notes)
+                              variances: variances, notes: notes, keepPane: keepPane)
         let safe = name.replacingOccurrences(of: "/", with: "-")
         if let data = try? JSONEncoder().encode(comp) {
             try? data.write(to: comparisonsDir.appendingPathComponent(safe + ".json"))
@@ -326,6 +349,7 @@ final class AppState {
               let comp = try? JSONDecoder().decode(Comparison.self, from: data) else { NSSound.beep(); return }
         variances = comp.variances
         notes = comp.notes
+        keepPane = comp.keepPane ?? 0
         for (i, path) in comp.paths.enumerated() where path != nil {
             load(URL(fileURLWithPath: path!), into: i)   // load() re-applies markup
         }
@@ -356,8 +380,19 @@ struct PDFPane: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
+                Button {
+                    state.keepPane = pane
+                } label: {
+                    Image(systemName: state.keepPane == pane ? "star.fill" : "star")
+                        .foregroundStyle(state.keepPane == pane ? Color.yellow : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Keep this doc — approving a variance keeps its wording")
                 Text(state.urls[pane]?.lastPathComponent ?? "No document")
                     .lineLimit(1).font(.callout)
+                if state.keepPane == pane {
+                    Text("KEEPING").font(.caption2.bold()).foregroundStyle(.yellow)
+                }
                 Spacer()
                 Button(state.soloPane == pane ? "Both" : "Solo") {
                     state.soloPane = state.soloPane == pane ? nil : pane
@@ -391,21 +426,28 @@ struct MarkupList: View {
 
     var body: some View {
         List {
-            Section("Variances") {
+            Section("Variances — ✓ keeps ★ doc's wording, A/B overrides") {
                 ForEach(state.variances) { v in
-                    HStack(alignment: .firstTextBaseline) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text("V\(v.n)").bold()
-                            .foregroundStyle(v.isApproved ? Color.green : Color.red)
+                            .foregroundStyle(v.isResolved ? Color.green : Color.orange)
                         Text(v.note ?? "").font(.callout).lineLimit(3)
                         Spacer()
+                        ForEach(0..<2, id: \.self) { side in
+                            Button(side == 0 ? "A" : "B") { state.resolve(v.n, winner: side) }
+                                .font(.caption.bold())
+                                .buttonStyle(.bordered)
+                                .tint(v.keep == side ? .green : .secondary)
+                                .help("Keep doc \(side == 0 ? "A" : "B")'s wording for this clause")
+                        }
                         Button {
-                            state.toggleApproved(v.n)
+                            state.resolve(v.n)
                         } label: {
-                            Image(systemName: v.isApproved ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(v.isApproved ? Color.green : Color.secondary)
+                            Image(systemName: v.isResolved ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(v.isResolved ? Color.green : Color.secondary)
                         }
                         .buttonStyle(.plain)
-                        .help(v.isApproved ? "Approved — click to un-approve" : "Approve this change")
+                        .help(v.isResolved ? "Resolved — click to reopen" : "Approve: keep the ★ doc's wording")
                     }
                     .contentShape(Rectangle())
                     .onTapGesture { state.goTo(v.n) }
@@ -453,9 +495,11 @@ struct WalkthroughView: View {
             are typed into Claude below. Finish your question and hit Return.
             4. “Compare Both” asks Claude to diff the two contracts. Claude numbers \
             every variance (V1, V2, …); both PDFs get margin V-badges + highlights, \
-            and the side panel lists them — click a row to jump, tick ◯ to approve \
-            (turns green). “Save Comparison…” in the Versions menu keeps it all; \
-            reload any saved version from the same menu.
+            and the side panel lists them. Star (★) a pane to mark the doc you're \
+            keeping; ticking ◯ on a variance approves it — the ★ doc's wording goes \
+            green, the other doc's gets struck out red. A/B buttons override per \
+            clause. “Save Comparison…” in the Versions menu keeps it all; reload any \
+            saved version from the same menu.
             5. “Solo” on a pane focuses one doc; highlight + “Annotate” adds your \
             own blue note (N1, N2, …), saved with the comparison.
 
