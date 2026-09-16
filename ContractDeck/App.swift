@@ -133,6 +133,10 @@ final class AppState {
         for (i, path) in pdfs.prefix(2).enumerated() { load(URL(fileURLWithPath: path), into: i) }
         try? FileManager.default.createDirectory(at: comparisonsDir,
                                                  withIntermediateDirectories: true)
+        // A variances.json left over from a previous session must not auto-load
+        // at launch — mark its current mtime as already seen; only writes made
+        // after launch (a fresh Compare) trigger the poller.
+        markupMtime = (try? FileManager.default.attributesOfItem(atPath: markupURL.path)[.modificationDate]) as? Date
         // ponytail: 2s mtime poll instead of a DispatchSource watcher
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pollMarkup() }
