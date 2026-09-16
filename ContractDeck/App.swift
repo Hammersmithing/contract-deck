@@ -71,12 +71,31 @@ struct TerminalHost: NSViewRepresentable {
 // MARK: - Variances
 
 /// One numbered difference between the two contracts, as reported by claude.
-struct Variance: Decodable, Identifiable {
+struct Variance: Codable, Identifiable {
     let n: Int
     let a: String   // short verbatim quote from doc A ("" if clause absent)
     let b: String   // short verbatim quote from doc B
     let note: String?
+    var approved: Bool?   // optional so claude's JSON (no such key) decodes
     var id: Int { n }
+    var isApproved: Bool { approved ?? false }
+}
+
+/// A user-added annotation: a quote in one pane plus a note.
+struct UserNote: Codable, Identifiable {
+    let id: UUID
+    let pane: Int
+    let quote: String
+    let note: String
+}
+
+/// A saved comparison: which docs, claude's variances (with approvals), user notes.
+struct Comparison: Codable {
+    var name: String
+    var date: Date
+    var paths: [String?]
+    var variances: [Variance]
+    var notes: [UserNote]
 }
 
 // MARK: - State
@@ -86,6 +105,9 @@ final class AppState {
     var urls: [URL?] = [nil, nil]
     var showWalkthrough = !UserDefaults.standard.bool(forKey: "walkthroughSeen")
     var variances: [Variance] = []
+    var notes: [UserNote] = []
+    var soloPane: Int? = nil
+    var showInspector = false
 
     @ObservationIgnored let pdfViews: [PDFView] = (0..<2).map { _ in
         let v = PDFView()
@@ -101,12 +123,15 @@ final class AppState {
     @ObservationIgnored private var markupMtime: Date?
     /// Per-variance located selections [paneA, paneB] for the jump menu.
     @ObservationIgnored private var located: [Int: [PDFSelection?]] = [:]
+    @ObservationIgnored private var locatedNotes: [UUID: PDFSelection] = [:]
+    @ObservationIgnored let comparisonsDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".contract-deck/comparisons")
 
     init() {
         // ponytail: `open --args left.pdf right.pdf` loads the panes at launch
         let pdfs = CommandLine.arguments.dropFirst().filter { $0.lowercased().hasSuffix(".pdf") }
         for (i, path) in pdfs.prefix(2).enumerated() { load(URL(fileURLWithPath: path), into: i) }
-        try? FileManager.default.createDirectory(at: markupURL.deletingLastPathComponent(),
+        try? FileManager.default.createDirectory(at: comparisonsDir,
                                                  withIntermediateDirectories: true)
         // ponytail: 2s mtime poll instead of a DispatchSource watcher
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -173,12 +198,44 @@ final class AppState {
               let parsed = try? JSONDecoder().decode([Variance].self, from: data) else { return }
         variances = parsed
         applyMarkup()
+        showInspector = true   // approvals happen here as results show up
     }
 
-    /// Stamp both panes: yellow highlight per line + red "V n" badge at the
-    /// first line of each located quote.
+    /// Find a quote in a pane's doc and stamp highlight lines + a margin badge.
+    /// The badge sits at the page's left edge (x=2), never over the text block.
+    /// Returns the located selection, or nil.
+    private func stamp(doc: PDFDocument, quote: String, label: String,
+                       highlight: NSColor, badgeColor: NSColor) -> PDFSelection? {
+        guard !quote.isEmpty,
+              let sel = doc.findString(quote, withOptions: [.caseInsensitive, .diacriticInsensitive]).first
+        else { return nil }
+        for line in sel.selectionsByLine() {
+            for page in line.pages {
+                let hl = PDFAnnotation(bounds: line.bounds(for: page), forType: .highlight, withProperties: nil)
+                hl.color = highlight
+                hl.userName = "ContractDeck"
+                page.addAnnotation(hl)
+            }
+        }
+        if let page = sel.pages.first {
+            let b = sel.bounds(for: page)
+            // ponytail: two quotes on the same line would overlap badges; fine for contracts
+            let badge = PDFAnnotation(bounds: CGRect(x: 2, y: b.maxY - 12, width: 22, height: 12),
+                                      forType: .freeText, withProperties: nil)
+            badge.contents = label
+            badge.font = NSFont.boldSystemFont(ofSize: 8)
+            badge.fontColor = .white
+            badge.color = badgeColor
+            badge.userName = "ContractDeck"
+            page.addAnnotation(badge)
+        }
+        return sel
+    }
+
+    /// Re-stamp both panes: variances (yellow, green once approved) + user notes (blue).
     private func applyMarkup() {
         located = [:]
+        locatedNotes = [:]
         for pane in 0..<2 {
             guard let doc = pdfViews[pane].document else { continue }
             for i in 0..<doc.pageCount {
@@ -188,29 +245,17 @@ final class AppState {
                 }
             }
             for v in variances {
-                let quote = pane == 0 ? v.a : v.b
-                guard !quote.isEmpty,
-                      let sel = doc.findString(quote, withOptions: [.caseInsensitive, .diacriticInsensitive]).first
-                else { located[v.n, default: [nil, nil]][pane] = nil; continue }
+                let hl: NSColor = v.isApproved ? NSColor.systemGreen.withAlphaComponent(0.35)
+                                               : NSColor.systemYellow.withAlphaComponent(0.5)
+                let sel = stamp(doc: doc, quote: pane == 0 ? v.a : v.b, label: "V\(v.n)",
+                                highlight: hl, badgeColor: v.isApproved ? .systemGreen : .systemRed)
                 located[v.n, default: [nil, nil]][pane] = sel
-                for line in sel.selectionsByLine() {
-                    for page in line.pages {
-                        let hl = PDFAnnotation(bounds: line.bounds(for: page), forType: .highlight, withProperties: nil)
-                        hl.color = NSColor.systemYellow.withAlphaComponent(0.5)
-                        hl.userName = "ContractDeck"
-                        page.addAnnotation(hl)
-                    }
-                }
-                if let page = sel.pages.first {
-                    let b = sel.bounds(for: page)
-                    let badge = PDFAnnotation(bounds: CGRect(x: max(2, b.minX - 30), y: b.maxY - 14, width: 26, height: 14),
-                                              forType: .freeText, withProperties: nil)
-                    badge.contents = "V\(v.n)"
-                    badge.font = NSFont.boldSystemFont(ofSize: 9)
-                    badge.fontColor = .white
-                    badge.color = .systemRed
-                    badge.userName = "ContractDeck"
-                    page.addAnnotation(badge)
+            }
+            for (i, note) in notes.enumerated() where note.pane == pane {
+                if let sel = stamp(doc: doc, quote: note.quote, label: "N\(i + 1)",
+                                   highlight: NSColor.systemBlue.withAlphaComponent(0.3),
+                                   badgeColor: .systemBlue) {
+                    locatedNotes[note.id] = sel
                 }
             }
         }
@@ -222,6 +267,78 @@ final class AppState {
         for pane in 0..<2 {
             if let sel = sels[pane] { pdfViews[pane].go(to: sel) }
         }
+    }
+
+    func goToNote(_ note: UserNote) {
+        if let sel = locatedNotes[note.id] { pdfViews[note.pane].go(to: sel) }
+    }
+
+    func toggleApproved(_ n: Int) {
+        guard let i = variances.firstIndex(where: { $0.n == n }) else { return }
+        variances[i].approved = !variances[i].isApproved
+        applyMarkup()
+    }
+
+    /// Turn the current selection into a user note (blue markup) on its pane.
+    func annotateSelection() {
+        let pane = soloPane ?? lastPane
+        guard let sel = pdfViews[pane].currentSelection,
+              let raw = sel.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { NSSound.beep(); return }
+        guard let text = Self.prompt("Note for this passage:", initial: "") else { return }
+        let quote = raw.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: " ")
+        notes.append(UserNote(id: UUID(), pane: pane, quote: quote, note: text))
+        applyMarkup()
+    }
+
+    func deleteNote(_ note: UserNote) {
+        notes.removeAll { $0.id == note.id }
+        applyMarkup()
+    }
+
+    // MARK: Saved comparisons
+
+    var savedComparisons: [URL] {
+        ((try? FileManager.default.contentsOfDirectory(at: comparisonsDir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+
+    func saveComparison() {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH.mm"
+        guard let name = Self.prompt("Name this comparison:", initial: df.string(from: Date())),
+              !name.isEmpty else { return }
+        let comp = Comparison(name: name, date: Date(), paths: urls.map { $0?.path },
+                              variances: variances, notes: notes)
+        let safe = name.replacingOccurrences(of: "/", with: "-")
+        if let data = try? JSONEncoder().encode(comp) {
+            try? data.write(to: comparisonsDir.appendingPathComponent(safe + ".json"))
+        }
+    }
+
+    func loadComparison(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let comp = try? JSONDecoder().decode(Comparison.self, from: data) else { NSSound.beep(); return }
+        variances = comp.variances
+        notes = comp.notes
+        for (i, path) in comp.paths.enumerated() where path != nil {
+            load(URL(fileURLWithPath: path!), into: i)   // load() re-applies markup
+        }
+        applyMarkup()   // covers the no-docs-changed case
+        showInspector = true
+    }
+
+    private static func prompt(_ title: String, initial: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.stringValue = initial
+        alert.accessoryView = field
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
     }
 }
 
@@ -238,6 +355,9 @@ struct PDFPane: View {
                 Text(state.urls[pane]?.lastPathComponent ?? "No document")
                     .lineLimit(1).font(.callout)
                 Spacer()
+                Button(state.soloPane == pane ? "Both" : "Solo") {
+                    state.soloPane = state.soloPane == pane ? nil : pane
+                }.controlSize(.small)
                 Button("Open…") { importing = true }.controlSize(.small)
             }
             .padding(6)
@@ -260,6 +380,60 @@ struct PDFViewRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: PDFView, context: Context) {}
 }
 
+// MARK: - Markup list (inspector)
+
+struct MarkupList: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        List {
+            Section("Variances") {
+                ForEach(state.variances) { v in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("V\(v.n)").bold()
+                            .foregroundStyle(v.isApproved ? Color.green : Color.red)
+                        Text(v.note ?? "").font(.callout).lineLimit(3)
+                        Spacer()
+                        Button {
+                            state.toggleApproved(v.n)
+                        } label: {
+                            Image(systemName: v.isApproved ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(v.isApproved ? Color.green : Color.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(v.isApproved ? "Approved — click to un-approve" : "Approve this change")
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { state.goTo(v.n) }
+                }
+                if state.variances.isEmpty {
+                    Text("Run “Compare Both” to get numbered variances.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            Section("My Notes") {
+                ForEach(Array(state.notes.enumerated()), id: \.element.id) { i, note in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("N\(i + 1)").bold().foregroundStyle(Color.blue)
+                        Text(note.note).font(.callout).lineLimit(3)
+                        Spacer()
+                        Button { state.deleteNote(note) } label: {
+                            Image(systemName: "trash").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { state.goToNote(note) }
+                }
+                if state.notes.isEmpty {
+                    Text("Highlight a passage and press “Annotate”.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Walkthrough
 
 struct WalkthroughView: View {
@@ -273,10 +447,13 @@ struct WalkthroughView: View {
             2. Highlight any passage with the mouse.
             3. Press ⌘⏎ (or “Ask About Highlight”) — the passage, file, and page \
             are typed into Claude below. Finish your question and hit Return.
-            4. “Compare Both” asks Claude to diff the two contracts clause by clause. \
-            Claude numbers every variance (V1, V2, …) and both PDFs get marked up: \
-            yellow highlight + red V-badge at each difference. The “Variances” \
-            toolbar menu jumps both panes to any V number.
+            4. “Compare Both” asks Claude to diff the two contracts. Claude numbers \
+            every variance (V1, V2, …); both PDFs get margin V-badges + highlights, \
+            and the side panel lists them — click a row to jump, tick ◯ to approve \
+            (turns green). “Save Comparison…” in the Versions menu keeps it all; \
+            reload any saved version from the same menu.
+            5. “Solo” on a pane focuses one doc; highlight + “Annotate” adds your \
+            own blue note (N1, N2, …), saved with the comparison.
 
             The bottom pane is a full live Claude Code terminal — type anything.
             Re-open this from Help → Contract Deck Walkthrough.
@@ -301,23 +478,33 @@ struct ContentView: View {
     var body: some View {
         VSplitView {
             HSplitView {
-                PDFPane(state: state, pane: 0).frame(minWidth: 250)
-                PDFPane(state: state, pane: 1).frame(minWidth: 250)
+                if state.soloPane != 1 { PDFPane(state: state, pane: 0).frame(minWidth: 250) }
+                if state.soloPane != 0 { PDFPane(state: state, pane: 1).frame(minWidth: 250) }
             }
             .frame(minHeight: 300)
             TerminalHost(view: state.terminal)
                 .frame(minHeight: 160)
         }
+        .inspector(isPresented: $state.showInspector) {
+            MarkupList(state: state)
+                .inspectorColumnWidth(min: 220, ideal: 280)
+        }
         .toolbar {
             Button("Ask About Highlight") { state.askAboutSelection() }
                 .keyboardShortcut(.return, modifiers: .command)
+            Button("Annotate") { state.annotateSelection() }
             Button("Compare Both") { state.compareBoth() }
-            if !state.variances.isEmpty {
-                Menu("Variances (\(state.variances.count))") {
-                    ForEach(state.variances) { v in
-                        Button("V\(v.n)  \(v.note ?? "")") { state.goTo(v.n) }
-                    }
+            Menu("Versions") {
+                Button("Save Comparison…") { state.saveComparison() }
+                Divider()
+                ForEach(state.savedComparisons, id: \.self) { url in
+                    Button(url.deletingPathExtension().lastPathComponent) { state.loadComparison(url) }
                 }
+            }
+            Button {
+                state.showInspector.toggle()
+            } label: {
+                Label("Variances", systemImage: "sidebar.trailing")
             }
         }
         .sheet(isPresented: $state.showWalkthrough) { WalkthroughView(state: state) }
