@@ -13,8 +13,8 @@ Claude. One window:
 - A live **Claude Code terminal** underneath (SwiftTerm PTY running `claude`).
 - A trailing **inspector panel** listing variances and user notes.
 
-Owner: James (Hammersmithing). Real use case: contract redlines with clients
-(e.g. a $7,220 music-video services agreement that came back with changes).
+Owner: James (Hammersmithing). Real use case: reviewing client contract
+redlines — comparing the version that came back against the one sent out.
 
 ## Working feature set (v as of 2026-09-16, commit `01bbcb1`)
 
