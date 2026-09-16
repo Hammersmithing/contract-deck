@@ -1,0 +1,36 @@
+name: ContractDeck
+options:
+  bundleIdPrefix: com.aldenhammersmith
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm.git
+    exactVersion: 1.13.0
+
+targets:
+  ContractDeck:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ContractDeck
+    dependencies:
+      - package: SwiftTerm
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aldenhammersmith.ContractDeck
+        PRODUCT_NAME: Contract Deck
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        DEVELOPMENT_TEAM: 68V2Q6SJH5
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: YES
+        # Sandbox intentionally OFF: we spawn /bin/zsh + claude and read PDFs anywhere.
+        INFOPLIST_KEY_CFBundleDisplayName: Contract Deck
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        COMBINE_HIDPI_IMAGES: YES
