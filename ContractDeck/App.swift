@@ -68,12 +68,24 @@ struct TerminalHost: NSViewRepresentable {
     func updateNSView(_ nsView: ClaudeTerminalView, context: Context) {}
 }
 
+// MARK: - Variances
+
+/// One numbered difference between the two contracts, as reported by claude.
+struct Variance: Decodable, Identifiable {
+    let n: Int
+    let a: String   // short verbatim quote from doc A ("" if clause absent)
+    let b: String   // short verbatim quote from doc B
+    let note: String?
+    var id: Int { n }
+}
+
 // MARK: - State
 
 @MainActor @Observable
 final class AppState {
     var urls: [URL?] = [nil, nil]
     var showWalkthrough = !UserDefaults.standard.bool(forKey: "walkthroughSeen")
+    var variances: [Variance] = []
 
     @ObservationIgnored let pdfViews: [PDFView] = (0..<2).map { _ in
         let v = PDFView()
@@ -83,16 +95,30 @@ final class AppState {
     @ObservationIgnored var lastPane = 0
     @ObservationIgnored let terminal = ClaudeTerminalView(frame: .init(x: 0, y: 0, width: 800, height: 300))
 
+    /// Where claude drops the numbered-variance JSON; polled every 2s.
+    @ObservationIgnored let markupURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".contract-deck/variances.json")
+    @ObservationIgnored private var markupMtime: Date?
+    /// Per-variance located selections [paneA, paneB] for the jump menu.
+    @ObservationIgnored private var located: [Int: [PDFSelection?]] = [:]
+
     init() {
         // ponytail: `open --args left.pdf right.pdf` loads the panes at launch
         let pdfs = CommandLine.arguments.dropFirst().filter { $0.lowercased().hasSuffix(".pdf") }
         for (i, path) in pdfs.prefix(2).enumerated() { load(URL(fileURLWithPath: path), into: i) }
+        try? FileManager.default.createDirectory(at: markupURL.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        // ponytail: 2s mtime poll instead of a DispatchSource watcher
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pollMarkup() }
+        }
     }
 
     func load(_ url: URL, into pane: Int) {
         guard let doc = PDFDocument(url: url) else { NSSound.beep(); return }
         urls[pane] = url
         pdfViews[pane].document = doc
+        applyMarkup()   // re-stamp existing variances onto the fresh document
     }
 
     /// Type text into the claude prompt without submitting, then focus the
@@ -120,7 +146,82 @@ final class AppState {
 
     func compareBoth() {
         guard let a = urls[0], let b = urls[1] else { NSSound.beep(); return }
-        type("Read '\(a.path)' and '\(b.path)' and compare these two contracts clause by clause. Flag every difference in terms, obligations, money, and dates. ")
+        // Fresh run: clear stale markup so old badges vanish and the poller
+        // fires on the newly written file.
+        try? FileManager.default.removeItem(at: markupURL)
+        markupMtime = nil
+        variances = []
+        applyMarkup()
+        type("""
+        Read '\(a.path)' and '\(b.path)' and compare these two contracts clause by clause. \
+        Number every variance V1, V2, … and write \(markupURL.path) as a JSON array \
+        [{"n":1,"a":"short quote from first doc","b":"short quote from second doc","note":"what changed"}] \
+        where each quote is copied VERBATIM from that PDF's extracted text, at most 12 words, unique \
+        enough to find by text search; use "" when the clause is absent from that doc. \
+        Then summarize each variance here by its V number, flagging differences in terms, \
+        obligations, money, and dates.
+        """.replacingOccurrences(of: "\n", with: ""))
+    }
+
+    // MARK: Markup
+
+    private func pollMarkup() {
+        guard let mtime = try? FileManager.default.attributesOfItem(atPath: markupURL.path)[.modificationDate] as? Date,
+              mtime != markupMtime else { return }
+        markupMtime = mtime
+        guard let data = try? Data(contentsOf: markupURL),
+              let parsed = try? JSONDecoder().decode([Variance].self, from: data) else { return }
+        variances = parsed
+        applyMarkup()
+    }
+
+    /// Stamp both panes: yellow highlight per line + red "V n" badge at the
+    /// first line of each located quote.
+    private func applyMarkup() {
+        located = [:]
+        for pane in 0..<2 {
+            guard let doc = pdfViews[pane].document else { continue }
+            for i in 0..<doc.pageCount {
+                guard let page = doc.page(at: i) else { continue }
+                for ann in page.annotations where ann.userName == "ContractDeck" {
+                    page.removeAnnotation(ann)
+                }
+            }
+            for v in variances {
+                let quote = pane == 0 ? v.a : v.b
+                guard !quote.isEmpty,
+                      let sel = doc.findString(quote, withOptions: [.caseInsensitive, .diacriticInsensitive]).first
+                else { located[v.n, default: [nil, nil]][pane] = nil; continue }
+                located[v.n, default: [nil, nil]][pane] = sel
+                for line in sel.selectionsByLine() {
+                    for page in line.pages {
+                        let hl = PDFAnnotation(bounds: line.bounds(for: page), forType: .highlight, withProperties: nil)
+                        hl.color = NSColor.systemYellow.withAlphaComponent(0.5)
+                        hl.userName = "ContractDeck"
+                        page.addAnnotation(hl)
+                    }
+                }
+                if let page = sel.pages.first {
+                    let b = sel.bounds(for: page)
+                    let badge = PDFAnnotation(bounds: CGRect(x: max(2, b.minX - 30), y: b.maxY - 14, width: 26, height: 14),
+                                              forType: .freeText, withProperties: nil)
+                    badge.contents = "V\(v.n)"
+                    badge.font = NSFont.boldSystemFont(ofSize: 9)
+                    badge.fontColor = .white
+                    badge.color = .systemRed
+                    badge.userName = "ContractDeck"
+                    page.addAnnotation(badge)
+                }
+            }
+        }
+    }
+
+    /// Scroll both panes to variance n.
+    func goTo(_ n: Int) {
+        guard let sels = located[n] else { return }
+        for pane in 0..<2 {
+            if let sel = sels[pane] { pdfViews[pane].go(to: sel) }
+        }
     }
 }
 
@@ -172,7 +273,10 @@ struct WalkthroughView: View {
             2. Highlight any passage with the mouse.
             3. Press ⌘⏎ (or “Ask About Highlight”) — the passage, file, and page \
             are typed into Claude below. Finish your question and hit Return.
-            4. “Compare Both” asks Claude to diff the two contracts clause by clause.
+            4. “Compare Both” asks Claude to diff the two contracts clause by clause. \
+            Claude numbers every variance (V1, V2, …) and both PDFs get marked up: \
+            yellow highlight + red V-badge at each difference. The “Variances” \
+            toolbar menu jumps both panes to any V number.
 
             The bottom pane is a full live Claude Code terminal — type anything.
             Re-open this from Help → Contract Deck Walkthrough.
@@ -208,6 +312,13 @@ struct ContentView: View {
             Button("Ask About Highlight") { state.askAboutSelection() }
                 .keyboardShortcut(.return, modifiers: .command)
             Button("Compare Both") { state.compareBoth() }
+            if !state.variances.isEmpty {
+                Menu("Variances (\(state.variances.count))") {
+                    ForEach(state.variances) { v in
+                        Button("V\(v.n)  \(v.note ?? "")") { state.goTo(v.n) }
+                    }
+                }
+            }
         }
         .sheet(isPresented: $state.showWalkthrough) { WalkthroughView(state: state) }
         .onReceive(NotificationCenter.default.publisher(for: .PDFViewSelectionChanged)) { note in
